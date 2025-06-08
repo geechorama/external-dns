@@ -142,7 +142,46 @@ func isValidIPv6(ip string) bool {
 	return addr.Is6()
 }
 
+func (p *piholeClientV6) listARecords(ctx context.Context) ([]*endpoint.Endpoint, error) {
+	results, err := p.getConfigValue(ctx, endpoint.RecordTypeA)
+	if err != nil {
+		return nil, err
+	}
+
+	resultMap := make(map[string][]string)
+	for _, record := range results {
+		parts := strings.Split(record, " ")
+		if len(parts) == 2 {
+			ip := parts[0]
+			host := parts[1]
+			if !isValidIPv4(ip) {
+				continue
+			}
+			resultMap[host] = append(resultMap[host], ip)
+		} else {
+			log.Debugf("Ignoring unexpected record: '%s'", record)
+		}
+	}
+	out := make([]*endpoint.Endpoint, 0)
+	for host, ips := range resultMap {
+		var Ttl = endpoint.TTL(0)
+		out = append(out, endpoint.NewEndpointWithTTL(host, endpoint.RecordTypeA, Ttl, ips...))
+	}
+
+	if log.GetLevel() >= log.DebugLevel {
+		for _, endpoint := range out {
+			log.Debugf("A record endpoint: %s", endpoint)
+		}
+	}
+
+	return out, nil
+}
+
 func (p *piholeClientV6) listRecords(ctx context.Context, rtype string) ([]*endpoint.Endpoint, error) {
+	if rtype == endpoint.RecordTypeA {
+		return p.listARecords(ctx)
+	}
+
 	out := make([]*endpoint.Endpoint, 0)
 	results, err := p.getConfigValue(ctx, rtype)
 	if err != nil {
@@ -272,37 +311,42 @@ func (p *piholeClientV6) apply(ctx context.Context, action string, ep *endpoint.
 		return nil
 	}
 
-	if p.cfg.DryRun {
-		log.Infof("DRY RUN: %s %s IN %s -> %s", action, ep.DNSName, ep.RecordType, ep.Targets[0])
-		return nil
-	}
+	for i := 0; i < len(ep.Targets); i++ {
 
-	log.Infof("%s %s IN %s -> %s", action, ep.DNSName, ep.RecordType, ep.Targets[0])
-
-	// Get the current record
-	if strings.Contains(ep.DNSName, "*") {
-		return provider.NewSoftError(errors.New("UNSUPPORTED: Pihole DNS names cannot return wildcard"))
-	}
-
-	switch ep.RecordType {
-	case endpoint.RecordTypeA, endpoint.RecordTypeAAAA:
-		apiUrl = p.generateApiUrl(apiUrl, fmt.Sprintf("%s %s", ep.Targets, ep.DNSName))
-	case endpoint.RecordTypeCNAME:
-		if ep.RecordTTL.IsConfigured() {
-			apiUrl = p.generateApiUrl(apiUrl, fmt.Sprintf("%s,%s,%d", ep.DNSName, ep.Targets, ep.RecordTTL))
-		} else {
-			apiUrl = p.generateApiUrl(apiUrl, fmt.Sprintf("%s,%s", ep.DNSName, ep.Targets))
+		if p.cfg.DryRun {
+			log.Infof("DRY RUN: %s %s IN %s -> %s", action, ep.DNSName, ep.RecordType, ep.Targets[i])
+			return nil
 		}
-	}
 
-	req, err := http.NewRequestWithContext(ctx, action, apiUrl, nil)
-	if err != nil {
-		return err
-	}
+		log.Infof("%s %s IN %s -> %s", action, ep.DNSName, ep.RecordType, ep.Targets[i])
 
-	_, err = p.do(req)
-	if err != nil {
-		return err
+		// Get the current record
+		if strings.Contains(ep.DNSName, "*") {
+			return provider.NewSoftError(errors.New("UNSUPPORTED: Pihole DNS names cannot return wildcard"))
+		}
+
+		var targetApiUrl string
+		switch ep.RecordType {
+		case endpoint.RecordTypeA, endpoint.RecordTypeAAAA:
+			targetApiUrl = p.generateApiUrl(apiUrl, fmt.Sprintf("%s %s", ep.Targets[i], ep.DNSName))
+			log.Debugf("api url: %s", targetApiUrl)
+		case endpoint.RecordTypeCNAME:
+			if ep.RecordTTL.IsConfigured() {
+				targetApiUrl = p.generateApiUrl(apiUrl, fmt.Sprintf("%s,%s,%d", ep.DNSName, ep.Targets[i], ep.RecordTTL))
+			} else {
+				targetApiUrl = p.generateApiUrl(apiUrl, fmt.Sprintf("%s,%s", ep.DNSName, ep.Targets[i]))
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, action, targetApiUrl, nil)
+		if err != nil {
+			return err
+		}
+
+		_, err = p.do(req)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
